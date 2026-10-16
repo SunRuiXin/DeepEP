@@ -201,6 +201,108 @@ Hybrid dispatch 显式设置三类 warp：
 
 缓存 dispatch 可重放已有布局，减少计数与 CPU 同步工作；只有路由与布局仍适用时才能复用。新的 decoding step 若重新 gating，必须重新 dispatch。原始 `topk_idx` 被 handle 引用，所有使用完成前不能修改。
 
+### 5.3 Hybrid 的三个映射字段有什么区别
+
+Hybrid 增加了“RDMA 到达转发 GPU，再由转发 GPU 向域内目标 GPU 分发”的阶段，因此需要保存不同层级的映射。以下说明针对 hybrid，不能直接套用到 direct 的同名字段。
+
+| 字段 | 由谁生成/持有 | 主要记录什么 | 缓存 dispatch | Combine |
+|---|---|---|---|---|
+| `dst_buffer_slot_idx` | 转发 GPU 的 forward warp 写入，保存在该 GPU 的 handle 中 | 按 channel、来源域、接收槽位和 top-k 槽定位域内目标 Buffer 槽位 | 复用目标槽位，避免重新分配 | 不直接作为参数传给 combine |
+| `token_metadata_at_forward` | 转发 GPU 的 forward warp 写入，保存在该 GPU 的 handle 中 | 按实际转发记录组织来源、chunk 标记、目标域内 rank 和目标槽位 | 重放转发记录与路径 | 也参与 hybrid 返回路径的组织 |
+| `channel_linked_list` | 接收目标 GPU 的 dispatch copy epilogue 填充，保存在该 GPU 的 handle 中 | 按 channel 和域内转发 peer 组织实际接收 token 索引及结束标记 | 作为已有布局保留、复用 | 遍历各 channel/peer 对应的接收 token，组织返回数据 |
+
+三个字段都是 GPU 上的整数张量，不保存 hidden 向量本身。每个 rank 都可能同时承担源端、转发端和最终接收端角色，因此自己的 handle 可以同时包含这些字段，但它们描述的是不同阶段的关系。
+
+#### Direct 模式：三个字段由谁生成和持有
+
+Direct 没有中间转发阶段，只使用这三个字段中的 `dst_buffer_slot_idx`。以下区分“主机端分配张量”与“GPU 内核填入映射内容”：
+
+| 字段 | 分配与生成 | 持有者 | 内容与用途 |
+|---|---|---|---|
+| `dst_buffer_slot_idx` | 本地 C++ `EPBuffer::dispatch()` 分配 CUDA int32 张量；源 GPU 的 direct dispatch 数据 warp 去重目标 rank、分配槽位后写入；缓存模式复用已有内容 | 原始发送 GPU 的 `EPHandle` | 形状 `[num_tokens, num_topk]`；记录本地输入 token 的发送目的槽位，供 cached dispatch 重放 |
+| `token_metadata_at_forward` | 不分配、不生成，因为没有 forward 阶段 | 没有有效张量；Python handle 字段为 `None` | Direct 不使用转发记录 |
+| `channel_linked_list` | 不分配、不生成；direct copy epilogue 不构建此表 | 没有有效张量；Python handle 字段为 `None` | Direct combine 不需要 hybrid 的 channel/peer 接收索引列表 |
+
+Direct 的槽位值为 `source_rank * num_max_tokens_per_rank + slot_idx`，定位目标 Buffer 中的来源 rank 区域和区域内槽位；目标 rank 本身来自 top-k 路由。无效或去重后的非代表条目为 `-1`。它不等于接收端整理后的 `recv_x` 行号。
+
+```text
+Direct：
+源 GPU：dispatch 数据 warp → 写 dst_buffer_slot_idx → 直接发送
+目标 GPU：接收 Buffer → copy epilogue → recv_x、recv_src_metadata
+
+Hybrid：
+转发 GPU：forward warp → 写 dst_buffer_slot_idx、token_metadata_at_forward → 域内分发
+目标 GPU：copy epilogue → 填 channel_linked_list、recv_src_metadata
+```
+
+Direct 接收端仍会生成 `recv_src_metadata` 保存来源及相关映射；不使用两个 hybrid 专用字段，不代表接收端不需要元数据。每个 rank 都可以既发送自己的 token，又接收别人的 token，但 direct 的 `dst_buffer_slot_idx` 描述的是其发送角色。
+
+#### 易混淆点：dst_buffer_slot_idx 究竟由发送方还是接收方持有？
+
+**共同语义是“下一步发送的目标槽位”，不是单纯的接收来源记录。** Direct 与 hybrid 的区别在于，这次发送发生在不同阶段。
+
+| 模式 | 谁写入、持有 | 记录哪一段发送 |
+|---|---|---|
+| Direct | 原始源 GPU 的 dispatch warp | 本地输入 token → 最终目标 GPU 的通信 Buffer |
+| Hybrid | 中间接收兼转发 GPU 的 forward warp | 已经通过 RDMA 收到的 token → 当前 scale-up 域内目标 GPU 的通信 Buffer |
+
+```text
+原始源 GPU ── RDMA → 中间 GPU ── NVLink → 最终目标 GPU
+                        │
+                        ├─ 对上一段：接收方
+                        ├─ 对下一段：发送方
+                        └─ 写入 hybrid 的 dst_buffer_slot_idx
+```
+
+因此，“direct 是发送方持有，hybrid 是接收方持有”的说法容易误导。Hybrid 的持有者确实先接收数据，但它记录的是自己的转发目的地。判断字段角色时，应追踪哪个 warp 写入，以及这个值随后用于哪次 store/put，不应仅凭它位于哪个 GPU。
+
+Direct 按 `[本地 token, top-k 槽]` 查目的槽位；hybrid 按 `[channel, 来源域, 接收槽位, top-k 槽]` 查转发目的槽位。后一种索引描述输入数据来自哪里，而条目的值描述随后写到哪里。
+
+一个 rank 可以同时承担原始发送、接收转发和最终接收角色；在 hybrid 中，同名字段记录的是它的 forward 角色。目标恰好是转发 GPU 自身时走本地写入，仍属于这段域内分发。
+
+#### dst_buffer_slot_idx：按接收位置查转发目的槽位
+
+```text
+形状：[num_channels, num_scaleout_ranks, num_max_tokens_per_channel, num_topk]
+索引：[channel, 来源 scale-out 域, channel 内接收槽位, top-k 槽]
+值：当前目标 scale-up 域内，目标 GPU Buffer 的槽位编号
+```
+
+例如 `[3, 1, 5, 0] = 27` 表示：channel 3 从来源域 1 的接收槽位 5 取得的 token，其第 0 个 top-k 选择转发到目标 Buffer 槽位 27。目标 GPU 由路由信息确定，值本身不编码目标 rank，也不是内存地址或最终 `recv_x` 行号。无效或去重后不负责独立转发的条目可为 `-1`。
+
+四维中的 scale-out 维度区分来源域，不表示再跨域发送。这一步主要是 NVLink 域内分发；目标为转发 GPU 自身时走本地路径。
+
+#### token_metadata_at_forward：按转发顺序组织完整记录
+
+```text
+形状：[num_channels, num_max_forwarded_tokens, 2 + 2 × num_topk]
+一条记录：
+[来源域与原始 token 的编码, chunk 结束标记,
+ num_topk 个目标域内 rank, num_topk 个目标槽位]
+```
+
+它记录的是接收兼转发 GPU 的转发过程，不是最终专家端的接收记录。目标槽位字段与 `dst_buffer_slot_idx` 的对应条目存在重复，但索引方式不同：前者按转发记录序号，后者按来源域和接收槽位查找。当前源码也有 TODO，讨论减少这些信息的冗余。
+
+#### channel_linked_list：按 channel/peer 遍历实际接收行
+
+```text
+形状：[num_channels,
+       num_scaleout_ranks × num_max_tokens_per_channel + 1,
+       num_scaleup_ranks]
+```
+
+固定 `[channel, :, peer]` 可以理解成一条索引列表。例如 `[7, 12, 4, -1]` 表示依次处理未展开接收 token 索引 7、12、4，遇到 `-1` 结束。即使 `do_expand=True`，这里也不能直接把这些索引当成专家展开后的 `recv_x` 行号；combine 会结合接收元数据处理对应的专家贡献。
+
+虽然名称是 linked list，当前 combine 通过列表位置递增读取，并非使用 CPU 风格的指针节点。Hybrid 转发阶段把列表位置写进传输 metadata；目标 GPU 的 copy epilogue 将该位置填成实际接收 token 索引并设置结束标记；combine 再遍历这份列表。
+
+```text
+转发端：接收槽位 → dst_buffer_slot_idx → 域内目标 Buffer 槽位
+转发端：转发记录 → token_metadata_at_forward → 来源/目标/槽位信息
+目标端：channel + 转发 peer → channel_linked_list → 实际接收 token 索引
+```
+
+源码入口：[csrc/buffers/ep.hpp](csrc/buffers/ep.hpp)、[hybrid_dispatch.cuh](deep_ep/include/deep_ep/impls/ep/hybrid_dispatch.cuh)、[dispatch_copy_epilogue.cuh](deep_ep/include/deep_ep/impls/ep/dispatch_copy_epilogue.cuh)、[hybrid_combine.cuh](deep_ep/include/deep_ep/impls/ep/hybrid_combine.cuh)。
+
 ## 6. Combine 与反向传播
 
 ### 6.1 Combine 的数学语义
@@ -270,6 +372,60 @@ TMA 减少线程搬运指令，但仍消耗 HBM/NVLink 带宽，并占用共享�
 Hybrid 使用 channel 的接收缓冲和 signaled tail，让 forward warp 根据已到达进度处理数据。批量更新进度可以减少通知开销，但更新过慢会延迟消费，小 batch 尤其敏感。
 
 当前 hybrid dispatch 的模板中可看到 `kScaleoutUpdateInterval` 等参数。理解其语义时同时追踪尾部不足一批的数据和 finish flag，不能只分析满批次路径。
+
+#### Channel 与 SM、CTA、warp、QP 的关系
+
+Channel 是算法划分的一条逻辑数据处理流水线：处理一部分 token，并维护相关缓冲区槽位、转发元数据和进度。它不是物理网络链路，也不对应一个固定目标 GPU。以下对应关系针对当前 `hybrid_dispatch_impl`，其他内核不一定采用同样分工。
+
+| 概念 | 含义 | 与 channel 的关系 |
+|---|---|---|
+| SM | GPU 的执行资源 | 执行 CTA 中的多个 warp |
+| CTA / block | 一组协作线程 | 包含 notify、scale-out、forward 三类 warp |
+| Warp | 32 个线程的执行组 | 一个 scale-out warp 负责一个发送 channel；一个 forward warp 负责对应的转发 channel |
+| QP | RDMA 请求队列资源 | 承接 channel 的网络请求，多个 channel 可以共享 |
+| Channel | 逻辑数据流水线 | 划分 token 工作并组织发送、接收后的转发进度 |
+
+**Token 工作划分。** 假设总共有 4 个 channel：
+
+```text
+channel 0：token 0、4、8……
+channel 1：token 1、5、9……
+channel 2：token 2、6、10……
+channel 3：token 3、7、11……
+```
+
+源码的发送循环使用步长分配：
+
+```cpp
+channel_idx = sm_idx * kNumChannelsPerSM + scaleout_warp_idx;
+for (int token_idx = channel_idx; token_idx < num_tokens; token_idx += kNumChannels) {
+    // 处理本 channel 的 token；每个 token 仍可发往多个目标域。
+}
+```
+
+**数量关系。** 当前 hybrid dispatch 中，scale-out warp 数等于 forward warp 数：
+
+```text
+总 channel 数 = num_sms × 每 CTA 的 scale-out warp 数
+总线程数/CTA = 32 ×（notify warp 数 + scale-out warp 数 + forward warp 数）
+```
+
+例如启动 4 个通信 CTA，每个 CTA 有 8 个 scale-out warp 和 8 个 forward warp，共有 32 个 channel。发送角色和转发角色各有 32 个 warp，使用相同范围的 channel 编号，并不是 64 个 channel。notify warp 是另一种角色，不计入这 32 条数据流水线。
+
+源码里的 `sm_idx` 实际来自 `blockIdx.x`；`num_sms` 用于设置通信 grid 的 block 数。这是实现采用的命名与资源配置方式，不是读取硬件 SM 编号，也不意味着预留了固定编号的 SM。
+
+**QP 映射。** `comm::get_qp_mode()` 根据 block、channel 和可用 QP 数选择队列及共享模式。QP 充足时可以为 channel 提供不同队列；不足时多个 channel 会共享 QP。notify 工作有单独的映射规则。因此不能把 channel 数直接当成 QP 数。
+
+```text
+channel 0 ─┐
+channel 1 ─┼─→ QP 0
+channel 2 ─┘
+channel 3 ───→ QP 1
+```
+
+**流水进度与最终同步。** 远端 forward warp 根据对应 channel 的已到达进度转发 token，无需等整个通信组所有 token 全部到达才开始转发。channel 进度通知服务于内核内部流水；最后的通信 barrier 则确认整轮数据就绪，使 copy epilogue 可以安全消费接收 Buffer。
+
+更多 channel 可以提高并行度、隐藏等待，但也增加 warp、共享内存、状态管理和通信资源需求，不是越多越好。阅读入口：[hybrid_dispatch.cuh](deep_ep/include/deep_ep/impls/ep/hybrid_dispatch.cuh) 与 [comm/barrier.cuh](deep_ep/include/deep_ep/comm/barrier.cuh)。
 
 ### 7.4 通信与计算争用
 
